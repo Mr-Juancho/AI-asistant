@@ -14,7 +14,8 @@ __pycache__/
 .DS_Store
 
 # Base de conocimiento con datos personales
-MyKnowledgeBase/
+myKnowledgeBase/
+
 
 # Base de datos de vectores generada
 chroma_db/
