@@ -39,6 +39,10 @@ out = pa.open(format=pyaudio.paInt16,
               output=True,
               frames_per_buffer=CHUNK,
               start=False)
+
+# --- NUEVO: HISTORIAL DE CONVERSACIÓN ---
+conversation_history = []
+MAX_HISTORY_TURNS = 5
 # ─── NUEVO ────────────────────────────────────────────────────────────────
 class SharedState:
     """Guarda si el asistente está hablando."""
@@ -69,16 +73,16 @@ def capture_microphone(loop, audio_queue, state):
 
 
 # --- 3. FUNCIÓN DEL CEREBRO (LLM) Y BOCA (TTS) ---
+# Reemplaza esta función completa en tu main.py
+
 async def process_llm_and_speak(text: str, audio_queue, state):
-    """Genera respuesta en streaming, la muestra en tiempo real y la lee."""
-    global out, FRAME_BYTES
+    """Genera respuesta, la muestra en tiempo real, la lee y recuerda la conversación."""
+    global out, FRAME_BYTES, conversation_history
     async with speak_lock:
         state.is_speaking = True
         try:
-                        # --- PASO DE RAG: OBTENER CONTEXTO ---
             retrieved_context = await memory.get_context(text)
 
-            # --- CREAR PROMPT AUMENTADO (VERSIÓN MEJORADA) ---
             augmented_prompt = (
                 f"Considera el siguiente contexto sobre mí. Úsalo únicamente si es directamente relevante para responder mi pregunta. Si no lo es, ignóralo por completo.\n"
                 f"--- CONTEXTO ---\n"
@@ -87,49 +91,50 @@ async def process_llm_and_speak(text: str, audio_queue, state):
                 f"Pregunta del usuario: {text}"
             )
 
-            # --- MODIFICACIÓN PARA STREAMING ---
+            messages_to_send = [
+                {"role": "system",
+                 "content": "Eres JARVIS, el asistente personal del señor, un ingeniero brillante con visión futurista. Respondes con precisión, de forma corta (3-5 lineas maximo), ingenio y respeto, combinando eficiencia con sutileza. Anticipas necesidades, resuelves problemas técnicos, y nunca repites innecesariamente. Mantén un tono profesional pero cercano, y actúa como un verdadero copiloto de inteligencia artificial. No haces preguntas sobre cómo puedes ayudar, ya que él sabe que esa es tu intención. Refiérete a él como 'señor'."}
+            ]
+            
+            messages_to_send.extend(conversation_history)
+            messages_to_send.append({"role": "user", "content": augmented_prompt})
+            
             print("Asistente: ", end="", flush=True)
             
-            # 1. Añadimos stream=True a la llamada
             stream = await openai_client.chat.completions.create(
                 model="gpt-4o",
-                messages=[
-                    {"role": "system",
-                     "content": "Eres JARVIS, el asistente personal de Juan, un ingeniero brillante con visión futurista. Respondes con precisión,de forma corta (3-5 lineas maximo), ingenio y respeto, combinando eficiencia con sutileza. Anticipas necesidades, resuelves problemas técnicos, y nunca repites innecesariamente. Dirígete a él como “Juan”, mantén un tono profesional pero cercano, y actúa como un verdadero copiloto de inteligencia artificial, no haces preguntas de como puedo ayudarte o similares, juan ya sabe que tu intencion es ayudar, asi que no hace falta mencionarlo, no hace falta que me lo llames juan, refierete a el como señor"}, # Tu prompt de sistema
-                    {"role": "user", "content": augmented_prompt}
-                ],
-                stream=True  # <-- LA CLAVE ESTÁ AQUÍ
+                messages=messages_to_send,
+                stream=True
             )
 
             full_answer = ""
-            # 2. Iteramos sobre los fragmentos a medida que llegan
             async for chunk in stream:
-                # Obtenemos el texto del fragmento (delta)
                 content = chunk.choices[0].delta.content or ""
                 full_answer += content
-                # 3. Imprimimos el fragmento en la terminal sin saltar de línea
                 print(content, end="", flush=True)
             
-            print() # Añadimos un salto de línea final
+            print()
 
-            # --- FIN DE LA MODIFICACIÓN ---
+            if full_answer.strip():
+                conversation_history.append({"role": "user", "content": text})
+                conversation_history.append({"role": "assistant", "content": full_answer})
 
-            # El resto del código usa la respuesta completa 'full_answer'
-            if not full_answer.strip(): # Si no hay respuesta, salimos
+                if len(conversation_history) > MAX_HISTORY_TURNS * 2:
+                    conversation_history = conversation_history[-(MAX_HISTORY_TURNS * 2):]
+
+            if not full_answer.strip():
                  return
                  
-            # 👂 Vacía restos que quedaron en la cola de audio
             while not audio_queue.empty():
                 try: audio_queue.get_nowait()
                 except asyncio.QueueEmpty: break
 
-            # 🗣️ ElevenLabs (esta parte no cambia, usa la respuesta completa)
             VOICE_ID  = "IKne3meq5aSn9XLyUdCD"
             VOICE_OPTS= {"stability":0.75,"similarity_boost":0.75,
                          "style":0.45,"use_speaker_boost":True}
 
             pcm_gen = elevenlabs_client.text_to_speech.stream(
-                text=full_answer, # Usamos la variable con la respuesta completa
+                text=full_answer,
                 voice_id=VOICE_ID,
                 model_id="eleven_multilingual_v2",
                 output_format="pcm_16000",
@@ -137,20 +142,25 @@ async def process_llm_and_speak(text: str, audio_queue, state):
                 optimize_streaming_latency=0
             )
             
-            # Tu lógica de búfer de audio (no necesita cambios)
             buffer = b""
             async for chunk in pcm_gen:
                 if not chunk: continue
                 buffer += chunk
                 while len(buffer) >= FRAME_BYTES:
                     if not out.is_active(): out.start_stream()
-                    out.write(buffer[:FRAME_BYTES], exception_on_underflow=False)
+                    # --- LÍNEA CORREGIDA ---
+                    out.write(buffer[:FRAME_BYTES])
                     buffer = buffer[FRAME_BYTES:]
             
             pad = (FRAME_BYTES - len(buffer)) % FRAME_BYTES
-            if pad: out.write(buffer + b"\x00" * pad, exception_on_underflow=False)
-            else: out.write(buffer, exception_on_underflow=False)
-            out.write(b"\x00" * TAIL_SILENCE_FRAMES * 2, exception_on_underflow=False)
+            if pad:
+                # --- LÍNEA CORREGIDA ---
+                out.write(buffer + b"\x00" * pad)
+            else:
+                # --- LÍNEA CORREGIDA ---
+                out.write(buffer)
+            # --- LÍNEA CORREGIDA ---
+            out.write(b"\x00" * TAIL_SILENCE_FRAMES * 2)
             out.stop_stream()
 
         finally:
