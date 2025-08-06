@@ -7,7 +7,6 @@ import json
 import threading
 from openai import AsyncOpenAI
 from elevenlabs.client import AsyncElevenLabs
-from elevenlabs import stream, play
 
 # --- 1. CONFIGURACIÓN INICIAL ---
 load_dotenv()
@@ -49,44 +48,55 @@ def capture_microphone(loop, audio_queue):
         audio.terminate()
 
 # --- 3. FUNCIÓN DEL CEREBRO (LLM) Y BOCA (TTS) ---
-# Reemplaza tu función entera con esta versión final y correcta
-async def process_llm_and_speak(text):
-    """Envía el texto a OpenAI y reproduce la respuesta de ElevenLabs en streaming."""
-    print("🧠 Pensando...")
-    
+# ── CEREBRO (GPT-4o) + BOCA (ElevenLabs Turbo PCM) ───────────────────────────
+async def process_llm_and_speak(text: str):
+    """Genera la respuesta con GPT-4o y la reproduce con ElevenLabs (PCM directo)."""
+    print("🧠 Pensando…")
+
+    VOICE_ID = "IKne3meq5aSn9XLyUdCD"        # Adam
+    VOICE_OPTS = {                           # tono un poco expresivo
+        "stability": 0.45,
+        "similarity_boost": 0.85,
+        "style": 0.15,
+        "use_speaker_boost": True,
+    }
+
     try:
-        response_stream = await openai_client.chat.completions.create(
+        # 1️⃣  LLM (sin cambios en tu lógica)
+        resp = await openai_client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "Eres JARVIS, un asistente de IA conversacional, directo, ingenioso y conciso."},
+                {"role": "system",
+                 "content": "Eres JARVIS, un asistente de IA conversacional, directo, ingenioso y conciso."},
                 {"role": "user", "content": text}
             ],
-            stream=True
+            stream=False
         )
-        
-        async def text_iterator():
-            async for chunk in response_stream:
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    print(delta, end="", flush=True)
-                    yield delta
-        
-        print("Asistente: ", end="", flush=True)
+        answer = resp.choices[0].message.content.strip()
+        print(f"Asistente: {answer}")
 
-        # LA LLAMADA FINAL Y CORRECTA CON EL CLIENTE ASÍNCRONO
-        audio_stream = await elevenlabs_client.generate(
-            text=text_iterator(),
-            voice="Adam", # Ahora el nombre "Adam" funcionará
-            model="eleven_multilingual_v2",
-            stream=True
+        # 2️⃣  ElevenLabs Turbo v2  →  streaming PCM 16 kHz
+        pcm_gen = elevenlabs_client.text_to_speech.stream(
+            text=answer,
+            voice_id=VOICE_ID,
+            model_id="eleven_multilingual_v2",
+            output_format="pcm_16000",
+            voice_settings=VOICE_OPTS
         )
-        
-        # 'stream' es una función de ayuda que consume el stream de audio
-        stream(audio_stream)
-        print("\n")
+
+        # 3️⃣  Reproduce los chunks al vuelo (sin mpv/ffplay)
+        pa = pyaudio.PyAudio()
+        out = pa.open(format=pyaudio.paInt16, channels=1, rate=16000, output=True)
+        async for chunk in pcm_gen:
+            if chunk:
+                out.write(chunk)
+        out.stop_stream()
+        out.close()
+        pa.terminate()
 
     except Exception as e:
         print(f"\nError en process_llm_and_speak: {e}")
+
         
 # --- 4. FUNCIÓN PRINCIPAL DE TRANSCRIPCIÓN (OÍDOS) ---
 async def transcribe_audio(loop, audio_queue):
