@@ -16,7 +16,7 @@ __pycache__/
 # Base de conocimiento con datos personales
 myKnowledgeBase/
 
-
+myKnowledgeBase/perfil_juan_pulgarin.txt
 # Base de datos de vectores generada
 chroma_db/
 
