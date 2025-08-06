@@ -8,19 +8,22 @@ client = AsyncElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
 RATE = 16000
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-VOICE_ID = "21m00Tcm4TlvDq8ikWAM"        # Adam
+VOICE_ID = "IKne3meq5aSn9XLyUdCD"        # Adam
 VOICE_OPTS = {                           # opcional
-    "stability": 0.45,
-    "similarity_boost": 0.85,
-    "style": 0.15,
+    "stability": 0.75,
+    "similarity_boost": 0.75,
+    "style": 0.45,
     "use_speaker_boost": True,
 }
 
 async def main():
     stream_gen = client.text_to_speech.stream(
-        text="Hi Sir, this is the correct way to generate audio with ElevenLabs.",
+        text = (
+            "Probando la nueva voz turbo: ¿qué tal suena ahora?. "
+            "<break time=\"0.3s\" />"
+            ),
         voice_id=VOICE_ID,
-        model_id="eleven_turbo_v2",
+        model_id="eleven_multilingual_v2",
         output_format="pcm_16000",
         voice_settings=VOICE_OPTS,
     )

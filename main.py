@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import pyaudio
 import websockets
 import json
+import time
 import threading
 from openai import AsyncOpenAI
 from elevenlabs.client import AsyncElevenLabs
@@ -25,124 +26,141 @@ FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
 CHUNK = 1024
+# ─── NUEVO ────────────────────────────────────────────────────────────────
+class SharedState:
+    """Guarda si el asistente está hablando."""
+    def __init__(self):
+        self.is_speaking = False
+
+state      = SharedState()      # instancia global
+speak_lock = asyncio.Lock()     # asegura que solo hable una tarea a la vez
 
 # --- 2. CAPTURA DE MICRÓFONO (PATRÓN CORREGIDO) ---
-def capture_microphone(loop, audio_queue):
-    """Captura audio del mic y lo pone en la cola usando el loop del hilo principal."""
-    import time
+def capture_microphone(loop, audio_queue, state):
+    """Lee el micrófono y envía audio a la cola SOLO cuando el asistente calla."""
     
-    audio = pyaudio.PyAudio()
-    stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+
+    pa      = pyaudio.PyAudio()
+    stream  = pa.open(format=FORMAT, channels=CHANNELS, rate=RATE,
+                      input=True, frames_per_buffer=CHUNK)
     print("🎤 Micrófono listo.")
-    
+
     try:
         while True:
-            data = stream.read(CHUNK, exception_on_overflow=False)
-            asyncio.run_coroutine_threadsafe(audio_queue.put(data), loop)
-            time.sleep(0.001)  # Pequeño delay para evitar saturar el CPU
-    except KeyboardInterrupt:
-        print("\n🛑 Deteniendo captura de audio...")
+            if not state.is_speaking:                       # ← aquí el mute
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                asyncio.run_coroutine_threadsafe(audio_queue.put(data), loop)
+            else:
+                time.sleep(0.005)                           # no saturar CPU
     finally:
-        stream.stop_stream()
-        stream.close()
-        audio.terminate()
+        stream.stop_stream(); stream.close(); pa.terminate()
+
 
 # --- 3. FUNCIÓN DEL CEREBRO (LLM) Y BOCA (TTS) ---
-# ── CEREBRO (GPT-4o) + BOCA (ElevenLabs Turbo PCM) ───────────────────────────
-async def process_llm_and_speak(text: str):
-    """Genera la respuesta con GPT-4o y la reproduce con ElevenLabs (PCM directo)."""
-    print("🧠 Pensando…")
+async def process_llm_and_speak(text: str, audio_queue, state):
+    """Genera respuesta y la lee; desactiva el micrófono durante la locución."""
+    async with speak_lock:                      # nunca dos voces a la vez
+        state.is_speaking = True                # 🔇  silencia el micrófono
+        try:
+            # 🧠 GPT-4o ------------------------------------------------------
+            resp = await openai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system",
+                     "content": "Eres JARVIS, el asistente personal de Juan, un ingeniero brillante con visión futurista. Respondes con precisión, ingenio y respeto, combinando eficiencia con sutileza. Anticipas necesidades, resuelves problemas técnicos, y nunca repites innecesariamente. Dirígete a él como “Juan”, mantén un tono profesional pero cercano, y actúa como un verdadero copiloto de inteligencia artificial"},
+                    {"role": "user", "content": text}
+                ]
+            )
+            answer = resp.choices[0].message.content.strip()
+            print(f"Asistente: {answer}")
 
-    VOICE_ID = "IKne3meq5aSn9XLyUdCD"        # Adam
-    VOICE_OPTS = {                           # tono un poco expresivo
-        "stability": 0.45,
-        "similarity_boost": 0.85,
-        "style": 0.15,
-        "use_speaker_boost": True,
-    }
+            # 👂 Vacía restos que quedaron en la cola de audio
+            while not audio_queue.empty():
+                try: audio_queue.get_nowait()
+                except asyncio.QueueEmpty: break
 
-    try:
-        # 1️⃣  LLM (sin cambios en tu lógica)
-        resp = await openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system",
-                 "content": "Eres JARVIS, un asistente de IA conversacional, directo, ingenioso y conciso."},
-                {"role": "user", "content": text}
-            ],
-            stream=False
-        )
-        answer = resp.choices[0].message.content.strip()
-        print(f"Asistente: {answer}")
+            # 🗣️ ElevenLabs --------------------------------------------------
+            VOICE_ID  = "IKne3meq5aSn9XLyUdCD"
+            VOICE_OPTS= {"stability":0.75,"similarity_boost":0.75,
+                         "style":0.45,"use_speaker_boost":True}
 
-        # 2️⃣  ElevenLabs Turbo v2  →  streaming PCM 16 kHz
-        pcm_gen = elevenlabs_client.text_to_speech.stream(
-            text=answer,
-            voice_id=VOICE_ID,
-            model_id="eleven_multilingual_v2",
-            output_format="pcm_16000",
-            voice_settings=VOICE_OPTS
-        )
+            pcm_gen = elevenlabs_client.text_to_speech.stream(
+                text=answer,
+                voice_id=VOICE_ID,
+                model_id="eleven_multilingual_v2",
+                output_format="pcm_16000",
+                voice_settings=VOICE_OPTS
+            )
 
-        # 3️⃣  Reproduce los chunks al vuelo (sin mpv/ffplay)
-        pa = pyaudio.PyAudio()
-        out = pa.open(format=pyaudio.paInt16, channels=1, rate=16000, output=True)
-        async for chunk in pcm_gen:
-            if chunk:
-                out.write(chunk)
-        out.stop_stream()
-        out.close()
-        pa.terminate()
+            pa  = pyaudio.PyAudio()
+            out = pa.open(format=pyaudio.paInt16, channels=1, rate=16000, output=True)
+            async for chunk in pcm_gen:
+                if chunk: out.write(chunk)
+            out.stop_stream(); out.close(); pa.terminate()
 
-    except Exception as e:
-        print(f"\nError en process_llm_and_speak: {e}")
-
+        finally:
+            state.is_speaking = False           # 🔈  reactiva el micrófono
         
 # --- 4. FUNCIÓN PRINCIPAL DE TRANSCRIPCIÓN (OÍDOS) ---
-async def transcribe_audio(loop, audio_queue):
-    """Escucha, envía a Deepgram y, al finalizar una frase, la pasa al cerebro."""
-    # AÑADIMOS EL PARÁMETRO DE IDIOMA
-    # ESTA ES LA LÍNEA CORREGIDA
-    DEEPGRAM_URL = f"wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate={RATE}&channels={CHANNELS}&language=es"
-    
-    try:
-        async with websockets.connect(DEEPGRAM_URL, additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}) as ws:
-            print("🟢 Conectado a Deepgram. ¡Habla ahora!")
+async def transcribe_audio(loop, audio_queue, state):
+    """Envía audio a Deepgram y pasa frases completas a GPT-4o."""
+    import websockets, json                     # imports locales
+    DEEPGRAM_URL = (f"wss://api.deepgram.com/v1/listen?"
+                    f"encoding=linear16&sample_rate=16000&channels=1&language=es")
 
-            async def sender(ws):
-                while True:
-                    data = await audio_queue.get()
+    async with websockets.connect(
+        DEEPGRAM_URL, additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+    ) as ws:
+        print("🟢 Conectado a Deepgram. ¡Habla ahora!")
+
+        # -------------- NUEVO sender() --------------
+        async def sender():
+            KEEPALIVE_EVERY = 3          # segundos (Deepgram corta a los ~10 s)
+            last_sent = time.monotonic()
+
+            while True:
+                if not state.is_speaking:
+                    data = await audio_queue.get()      # audio real
                     await ws.send(data)
+                    last_sent = time.monotonic()
+                else:
+                    # Durante la locución envía solo KeepAlive
+                    if time.monotonic() - last_sent >= KEEPALIVE_EVERY:
+                        await ws.send('{"type":"KeepAlive"}')
+                        last_sent = time.monotonic()
+                    await asyncio.sleep(0.05)           # no satures CPU
+        # --------------------------------------------
 
-            async def receiver(ws):
-                full_transcript = ""
-                async for msg in ws:
-                    res = json.loads(msg)
-                    transcript = res.get('channel', {}).get('alternatives', [{}])[0].get('transcript', '')
-                    
-                    # Esta lógica es buena: esperamos a que termines la frase para no enviar texto a medias
-                    if transcript and res.get('is_final', False):
-                        full_transcript += transcript + " "
-                        print(f"Tú: {full_transcript}")
-                        # Una vez que tenemos una frase completa, la enviamos al cerebro
-                        # Usamos create_task para que no bloquee la recepción de más mensajes
-                        loop.create_task(process_llm_and_speak(full_transcript))
-                        full_transcript = ""
 
-            await asyncio.gather(sender(ws), receiver(ws))
-            
-    except Exception as e:
-        print(f"Error de conexión con Deepgram: {e}")
+        async def receiver():
+            full = ""
+            async for msg in ws:
+                res   = json.loads(msg)
+                trans = res.get("channel", {}).get("alternatives", [{}])[0].get("transcript", "")
+                if trans and res.get("is_final", False):
+                    full += trans + " "
+                    print(f"Tú: {full}")
+                    if not state.is_speaking:   # no interrumpir la locución
+                        loop.create_task(process_llm_and_speak(full, audio_queue, state))
+                    full = ""
+
+        await asyncio.gather(sender(), receiver())
+
 
 # --- 5. PUNTO DE ENTRADA PRINCIPAL (PATRÓN CORREGIDO) ---
 async def main():
     audio_queue = asyncio.Queue()
-    loop = asyncio.get_running_loop()
-    
-    mic_thread = threading.Thread(target=capture_microphone, args=(loop, audio_queue), daemon=True)
+    loop        = asyncio.get_running_loop()
+
+    # Hilo de micrófono
+    mic_thread = threading.Thread(
+        target=capture_microphone,
+        args=(loop, audio_queue, state),
+        daemon=True
+    )
     mic_thread.start()
-    
-    await transcribe_audio(loop, audio_queue)
+
+    await transcribe_audio(loop, audio_queue, state)
 
 if __name__ == "__main__":
     try:
