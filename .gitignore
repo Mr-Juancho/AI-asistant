@@ -1,0 +1,14 @@
+# Archivos de entorno virtual
+envai/
+venv/
+*.venv
+
+# Archivos de secretos (¡MUY IMPORTANTE!)
+.env
+
+# Archivos generados por Python
+__pycache__/
+*.pyc
+
+# Archivos del sistema operativo macOS
+.DS_Store
