@@ -8,9 +8,12 @@ import time
 import threading
 from openai import AsyncOpenAI
 from elevenlabs.client import AsyncElevenLabs
+from memory import MemoryManager
 
 # --- 1. CONFIGURACIÓN INICIAL ---
 load_dotenv()
+# Inicializa el gestor de memoria
+memory = MemoryManager()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
@@ -72,6 +75,18 @@ async def process_llm_and_speak(text: str, audio_queue, state):
     async with speak_lock:
         state.is_speaking = True
         try:
+                        # --- PASO DE RAG: OBTENER CONTEXTO ---
+            retrieved_context = await memory.get_context(text)
+
+            # --- CREAR PROMPT AUMENTADO (VERSIÓN MEJORADA) ---
+            augmented_prompt = (
+                f"Considera el siguiente contexto sobre mí. Úsalo únicamente si es directamente relevante para responder mi pregunta. Si no lo es, ignóralo por completo.\n"
+                f"--- CONTEXTO ---\n"
+                f"{retrieved_context}\n"
+                f"--- FIN DEL CONTEXTO ---\n\n"
+                f"Pregunta del usuario: {text}"
+            )
+
             # --- MODIFICACIÓN PARA STREAMING ---
             print("Asistente: ", end="", flush=True)
             
@@ -81,7 +96,7 @@ async def process_llm_and_speak(text: str, audio_queue, state):
                 messages=[
                     {"role": "system",
                      "content": "Eres JARVIS, el asistente personal de Juan, un ingeniero brillante con visión futurista. Respondes con precisión,de forma corta (3-5 lineas maximo), ingenio y respeto, combinando eficiencia con sutileza. Anticipas necesidades, resuelves problemas técnicos, y nunca repites innecesariamente. Dirígete a él como “Juan”, mantén un tono profesional pero cercano, y actúa como un verdadero copiloto de inteligencia artificial, no haces preguntas de como puedo ayudarte o similares, juan ya sabe que tu intencion es ayudar, asi que no hace falta mencionarlo, no hace falta que me lo llames juan, refierete a el como señor"}, # Tu prompt de sistema
-                    {"role": "user", "content": text}
+                    {"role": "user", "content": augmented_prompt}
                 ],
                 stream=True  # <-- LA CLAVE ESTÁ AQUÍ
             )

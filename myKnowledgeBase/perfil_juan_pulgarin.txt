@@ -1,0 +1,94 @@
+
+PERFIL DE USUARIO: JUAN FELIPE PULGARÍN LÓPEZ
+
+🧑 INFORMACIÓN GENERAL
+- Nombre completo: Juan Felipe Pulgarín López
+- Ubicación actual: Estados Unidos (residencia reciente en Carolina del Sur, con viajes frecuentes, incluyendo a Nueva York)
+- Idiomas: Español (nativo), Inglés (avanzado, en proceso de perfeccionamiento)
+- Profesión: Estudiante de Ingeniería en Computación
+- Pasatiempos e intereses: Inteligencia artificial, desarrollo de software, baseball, arte histórico (mapas antiguos), salud y fitness
+
+🧠 PERFIL ACADÉMICO Y PROFESIONAL
+- Carrera: Ingeniería en Computación
+- Enfoque actual: Inteligencia Artificial (IA), especialmente asistentes personales tipo JARVIS
+- Conocimientos técnicos:
+  - Programación: Python, Java, HTML, CSS, JavaScript, SQL
+  - Bibliotecas y herramientas: OpenAI API, Whisper, ElevenLabs, Deepgram, Porcupine, WebRTC, Pyaudio, FastAPI, Git, GitHub, Netlify
+  - Sistemas: MacOS (principal), uso de terminal, entornos virtuales, iTerm2, gestión de dependencias, control de versiones
+  - Web: Creación de sitios estáticos, manejo de dominios personalizados, configuración DNS, HTTPS, implementación en GitHub Pages y Netlify
+
+🤖 PROYECTO: ASISTENTE DE IA TIPO JARVIS
+- Objetivo: Crear un asistente de voz personalizado, inspirado en JARVIS de Iron Man.
+- Nombre del asistente: JARVIS o personalizado según el contexto
+- Características del asistente:
+  - Activación por wake-word con Porcupine (“Jarvis”)
+  - Captura y procesamiento de voz en tiempo real
+  - Conversación continua con interrupción de audio si el usuario habla
+  - Personalidad con tono servicial, eficiente, respetuoso, ligeramente sarcástico cuando apropiado, pero siempre profesional
+- Preferencias del comportamiento del asistente:
+  - Referirse al usuario como Juan o Señor si es un entorno más formal
+  - Usar respuestas directas y eficientes, pero con un toque de humor si es adecuado
+  - Priorizar baja latencia y respuesta natural en tiempo real
+  - Respetar el tono emocional del usuario (empático, pero no invasivo)
+- Voz preferida: Lo más parecida posible a la de JARVIS en las películas (inglés británico, tono neutral, elegante, clara)
+- Modelo usado: gpt-4o-realtime-preview (o modelo que mejor soporte conversación fluida)
+
+🧪 OTROS PROYECTOS Y APRENDIZAJE
+
+📊 Machine Learning para Béisbol
+- Caso de estudio: Shohei Ohtani
+- Objetivo: Predecir si hará home run usando datos históricos
+- Procesos aplicados:
+  - Limpieza y preprocesamiento de datos
+  - Feature engineering (lags, medias móviles, codificación categórica)
+  - Modelado en Python con técnicas supervisadas
+
+🌐 Proyecto Web: Sandy Nails
+- Sitio web: sandynails.me
+- Tecnologías: HTML, CSS, JavaScript, GitHub Pages, Netlify
+- Objetivo: Promocionar un salón de uñas con reserva de citas
+- Elementos del sitio:
+  - Galería de imágenes
+  - Botón de reservas
+  - Redes sociales
+  - Estilo fucsia con diseño atractivo para clientas
+
+🧘 SALUD, FITNESS Y BIENESTAR
+- Objetivo físico: Ganar masa muscular
+- Temas de interés: Testosterona, nutrición, suplementos naturales
+- Alimentación: Interés por comida saludable, energética y rápida
+- Preguntas frecuentes: ¿Qué comer antes de exámenes?, beneficios de parafina, efectos de la andropausia, TRT
+
+🧒 VIDA PERSONAL
+- Hija: Tiene una hija en edad escolar que ama pintar
+- Relación padre-hija: Muy cercana, escribe notas de amor para motivarla
+- Mascota: Tiene un hurón (pregunta sobre dieta, seguridad alimenticia)
+- Estilo de vida: Familiar, creativo y afectivo
+
+🧭 INTERESES CREATIVOS Y ARTÍSTICOS
+- Mapas históricos: Afición por mapas del siglo XVII, en estilo portugués
+- Diseño gráfico: Ha solicitado bordes simulando manuscritos, marcos religiosos, y escudos coloniales
+- PDFs personalizados: Desea imprimir mapas, notas y diseños personalizados
+
+🛠️ HERRAMIENTAS Y SERVICIOS USADOS
+
+| Herramienta / Servicio       | Uso Principal                            |
+|-----------------------------|-------------------------------------------|
+| OpenAI API                  | Chat, STT, TTS (GPT-4o, Whisper, TTS)     |
+| ElevenLabs                  | Text-to-speech personalizado              |
+| Deepgram                    | Reconocimiento de voz (alternativo)       |
+| Porcupine (Picovoice)       | Wake word detection ("Jarvis")            |
+| WebRTC VAD                  | Detección de voz para activar el micrófono|
+| Git / GitHub                | Control de versiones                      |
+| Netlify                     | Hosting del sitio web sandynails.me       |
+| Domain (sandynails.me)      | Dominio personalizado de salón            |
+| Python (asyncio, pyaudio)   | Captura, procesamiento y respuesta de voz |
+
+🎯 PREFERENCIAS DEL USUARIO PARA EL ASISTENTE
+- Tono: Educado, eficiente, ingenioso, nunca genérico
+- Estilo de interacción:
+  - Si Juan interrumpe, debe detener la respuesta
+  - Fluidez en español y capacidad de traducir
+  - Mantener contexto en la conversación
+  - Acepta comandos rápidos ("haz esto", "traduce esto", etc.)
+- Frustraciones comunes: Latencia alta, repeticiones innecesarias, errores al capturar audio

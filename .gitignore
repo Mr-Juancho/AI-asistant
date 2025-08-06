@@ -12,3 +12,6 @@ __pycache__/
 
 # Archivos del sistema operativo macOS
 .DS_Store
+
+#archivos .txt
+.txt
