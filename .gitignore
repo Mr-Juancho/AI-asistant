@@ -18,3 +18,5 @@ MyKnowledgeBase/
 
 # Base de datos de vectores generada
 chroma_db/
+
+.perfil_juan_pulgarin.txt
