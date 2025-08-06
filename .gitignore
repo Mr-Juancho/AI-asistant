@@ -13,5 +13,8 @@ __pycache__/
 # Archivos del sistema operativo macOS
 .DS_Store
 
-#archivos .txt
-.txt
+# Base de conocimiento con datos personales
+MyKnowledgeBase/
+
+# Base de datos de vectores generada
+chroma_db/
