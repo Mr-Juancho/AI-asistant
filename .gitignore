@@ -1,23 +1,15 @@
-# Archivos de entorno virtual
-envai/
-venv/
-*.venv
-
-# Archivos de secretos (¡MUY IMPORTANTE!)
+# Archivos de entorno y secretos (¡MUY IMPORTANTE!)
 .env
-
-# Archivos generados por Python
-__pycache__/
-*.pyc
-
-# Archivos del sistema operativo macOS
-.DS_Store
+envai/
+.venv
 
 # Base de conocimiento con datos personales
 myKnowledgeBase/
 
-myKnowledgeBase/perfil_juan_pulgarin.txt
 # Base de datos de vectores generada
 chroma_db/
 
-.perfil_juan_pulgarin.txt
+# Archivos generados por Python y macOS
+__pycache__/
+*.pyc
+.DS_Store
