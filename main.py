@@ -1,5 +1,13 @@
+# realtime_assistant_step3_tts_por_trozos.py
+# Paso 3: TTS por trozos (empieza a hablar con los primeros tokens)
+# - El LLM stream se trocea por oraciones/longitud y se manda a ElevenLabs en piezas.
+# - Latencia real baja: el audio arranca con los primeros tokens.
+# - Mantiene la consola con colores ([TÚ] rojo, [ASISTENTE] azul) y previews de Paso 2.
+# - Previews se cancelan cuando llega el final y arranca el TTS.
+
 import asyncio
 import os
+import re
 from dotenv import load_dotenv
 import pyaudio
 import websockets
@@ -10,27 +18,26 @@ from openai import AsyncOpenAI
 from elevenlabs.client import AsyncElevenLabs
 from memory import MemoryManager
 
-# --- 1. CONFIGURACIÓN INICIAL ---
+# ───────────────────────────────────────────────────────────────────────────
+# 1) CONFIG INICIAL
+# ───────────────────────────────────────────────────────────────────────────
 load_dotenv()
-# Inicializa el gestor de memoria
 memory = MemoryManager()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 
-# Inicializa los clientes de las APIs
-# LÍNEA CORREGIDA
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-# LÍNEA CORREGIDA
-elevenlabs_client = AsyncElevenLabs(api_key=ELEVENLABS_API_KEY)
+OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY")
+DEEPGRAM_API_KEY    = os.getenv("DEEPGRAM_API_KEY")
+ELEVENLABS_API_KEY  = os.getenv("ELEVENLABS_API_KEY")
 
-# Configuración del audio
-FORMAT = pyaudio.paInt16
+openai_client       = AsyncOpenAI(api_key=OPENAI_API_KEY)
+elevenlabs_client   = AsyncElevenLabs(api_key=ELEVENLABS_API_KEY)
+
+# Audio I/O
+FORMAT   = pyaudio.paInt16
 CHANNELS = 1
-RATE = 16000
-CHUNK = 512
-pa  = pyaudio.PyAudio()
-FRAME_BYTES = CHUNK * 2 
+RATE     = 16000
+CHUNK    = 480          # 10–20 ms
+pa       = pyaudio.PyAudio()
+FRAME_BYTES = CHUNK * 2
 TAIL_SILENCE_FRAMES = CHUNK * 4
 
 out = pa.open(format=pyaudio.paInt16,
@@ -39,172 +46,632 @@ out = pa.open(format=pyaudio.paInt16,
               output=True,
               frames_per_buffer=CHUNK,
               start=False)
-# ─── NUEVO ────────────────────────────────────────────────────────────────
+
+# Historial (RAM por ahora)
+conversation_history = []
+MAX_HISTORY_TURNS = 5
+
+# Globals
+current_llm_task = None
+current_preview_task = None
+tts_started_event = asyncio.Event()
+llm_text_queue = asyncio.Queue(maxsize=8)
+
+grace_mode = False
+suppress_user_partials = False   # ⬅️ NUEVO: no pintes [TÚ] mientras habla el asistente
+assistant_printing = False  # suspende la línea [TÚ] mientras el asistente imprime
+
+
+
+# Estado compartido
 class SharedState:
-    """Guarda si el asistente está hablando."""
     def __init__(self):
-        self.is_speaking = False
+        self.is_speaking = False      # True solo al arrancar TTS
 
-state      = SharedState()      # instancia global
-speak_lock = asyncio.Lock()     # asegura que solo hable una tarea a la vez
+state      = SharedState()
+speak_lock = asyncio.Lock()
 
-# --- 2. CAPTURA DE MICRÓFONO (PATRÓN CORREGIDO) ---
+# ───────────────────────────────────────────────────────────────────────────
+# Utilidades de impresión sincronizada + colores
+# ───────────────────────────────────────────────────────────────────────────
+print_lock = threading.Lock()
+
+# ANSI
+RESET = "\x1b[0m"
+BOLD  = "\x1b[1m"
+DIM   = "\x1b[2m"
+RED   = "\x1b[31m"
+BLUE  = "\x1b[34m"
+GRAY  = "\x1b[90m"
+
+def c(text: str, color: str) -> str:
+    return f"{color}{text}{RESET}"
+
+def tag(role: str, color: str, dim: bool=False) -> str:
+    style = (DIM if dim else BOLD)
+    return f"{style}{color}[{role}]{RESET}"
+
+def clear_partial_line(width: int = 140):
+    with print_lock:
+        print("\r" + (" " * width) + "\r", end="", flush=True)
+
+def sprint(msg: str = "", end: str = "\n"):
+    with print_lock:
+        print(msg, end=end, flush=True)
+
+def render_user_partial(text: str, width: int = 120):
+    # No re-pintar la línea del usuario si el asistente está imprimiendo o si la voz está sonando
+    if suppress_user_partials or assistant_printing:
+        return
+    with print_lock:
+        lbl = tag("TÚ", RED)
+        print(f"\r{lbl}: {text:<{width}}", end="", flush=True)
+
+
+# ⬇️ PÉGALO AQUÍ
+def merge_with_overlap(prev: str, nxt: str, max_overlap: int = 24) -> str:
+    """
+    Une prev + nxt eliminando solapes (p.ej., 'Tiene el micrófono' + 'micrófono distante').
+    Compara sufijo de prev con prefijo de nxt, sin sensibilidad a mayúsculas.
+    """
+    prev = prev.rstrip()
+    nxt  = nxt.lstrip()
+    max_len = min(max_overlap, len(prev), len(nxt))
+    for k in range(max_len, 0, -1):
+        if prev[-k:].lower() == nxt[:k].lower():
+            return (prev + nxt[k:]).strip()
+    # sin solape claro, mete un espacio si hace falta
+    joiner = "" if (prev.endswith((" ", "\n")) or nxt.startswith((" ", "\n"))) else " "
+    return (prev + joiner + nxt).strip()
+
+async def fetch_tts_pcm(text: str, voice_id: str, voice_opts: dict, model_id: str = "eleven_multilingual_v2") -> bytes:
+    """
+    Descarga por completo el PCM de un trozo de texto usando ElevenLabs, devolviendo bytes.
+    Sirve para prefetch del siguiente trozo y evitar huecos entre streams.
+    """
+    pcm_gen = elevenlabs_client.text_to_speech.stream(
+        text=text,
+        voice_id=voice_id,
+        model_id=model_id,
+        output_format="pcm_16000",
+        voice_settings=voice_opts,
+        optimize_streaming_latency=1  # 1 = estable/rápido; cambia a 2 si la red es variable
+    )
+    buf = bytearray()
+    async for chunk in pcm_gen:
+        if chunk:
+            buf.extend(chunk)
+    return bytes(buf)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 2) MICRÓFONO
+# ───────────────────────────────────────────────────────────────────────────
 def capture_microphone(loop, audio_queue, state):
-    """Lee el micrófono y envía audio a la cola SOLO cuando el asistente calla."""
-    
-
     stream = pa.open(format=FORMAT, channels=CHANNELS, rate=RATE,
-                 input=True, frames_per_buffer=CHUNK)
-    print("🎤 Micrófono listo.")
-
+                     input=True, frames_per_buffer=CHUNK, start=True)
+    sprint(c("🎤 Micrófono listo.", GRAY))
     try:
         while True:
-            if not state.is_speaking:                       # ← aquí el mute
+            if not state.is_speaking:
                 data = stream.read(CHUNK, exception_on_overflow=False)
                 asyncio.run_coroutine_threadsafe(audio_queue.put(data), loop)
             else:
-                time.sleep(0.005)                           # no saturar CPU
+                time.sleep(0.005)
     finally:
-        stream.stop_stream(); stream.close(); pa.terminate()
+        stream.stop_stream()
+        stream.close()
+
+# ───────────────────────────────────────────────────────────────────────────
+# 3) PIPELINE LLM → TTS sincronizado (una sola pasada, sin desync)
+# ───────────────────────────────────────────────────────────────────────────
+TTS_MIN_CHARS       = 120   # antes 100
+TTS_MAX_CHARS       = 300   # antes 260
+TTS_TIME_FLUSH_MS   = 700   # antes 600
+
+FIRST_CHUNK_TIME_FLUSH_MS = 260  # antes 280
+FIRST_CHUNK_MIN_CHARS     = 18   # antes 16
 
 
-# --- 3. FUNCIÓN DEL CEREBRO (LLM) Y BOCA (TTS) ---
-async def process_llm_and_speak(text: str, audio_queue, state):
-    """Genera respuesta en streaming, la muestra en tiempo real y la lee."""
-    global out, FRAME_BYTES
-    async with speak_lock:
-        state.is_speaking = True
-        try:
-                        # --- PASO DE RAG: OBTENER CONTEXTO ---
-            retrieved_context = await memory.get_context(text)
 
-            # --- CREAR PROMPT AUMENTADO (VERSIÓN MEJORADA) ---
-            augmented_prompt = (
-                f"Considera el siguiente contexto sobre mí. Úsalo únicamente si es directamente relevante para responder mi pregunta. Si no lo es, ignóralo por completo.\n"
-                f"--- CONTEXTO ---\n"
-                f"{retrieved_context}\n"
-                f"--- FIN DEL CONTEXTO ---\n\n"
-                f"Pregunta del usuario: {text}"
-            )
+async def speak_worker(tts_queue: asyncio.Queue, state):
+    global out, FRAME_BYTES, TAIL_SILENCE_FRAMES
 
-            # --- MODIFICACIÓN PARA STREAMING ---
-            print("Asistente: ", end="", flush=True)
-            
-            # 1. Añadimos stream=True a la llamada
-            stream = await openai_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system",
-                     "content": "Eres JARVIS, el asistente personal de Juan, un ingeniero brillante con visión futurista. Respondes con precisión,de forma corta (3-5 lineas maximo), ingenio y respeto, combinando eficiencia con sutileza. Anticipas necesidades, resuelves problemas técnicos, y nunca repites innecesariamente. Dirígete a él como “Juan”, mantén un tono profesional pero cercano, y actúa como un verdadero copiloto de inteligencia artificial, no haces preguntas de como puedo ayudarte o similares, juan ya sabe que tu intencion es ayudar, asi que no hace falta mencionarlo, no hace falta que me lo llames juan, refierete a el como señor"}, # Tu prompt de sistema
-                    {"role": "user", "content": augmented_prompt}
-                ],
-                stream=True  # <-- LA CLAVE ESTÁ AQUÍ
-            )
+    VOICE_ID   = "IKne3meq5aSn9XLyUdCD"
+    VOICE_OPTS = {
+        "stability": 0.75,
+        "similarity_boost": 0.75,
+        "style": 0.45,
+        "use_speaker_boost": True,
+        "speed": 1.15,
+    }
+    MODEL_ID = "eleven_multilingual_v2"
 
-            full_answer = ""
-            # 2. Iteramos sobre los fragmentos a medida que llegan
-            async for chunk in stream:
-                # Obtenemos el texto del fragmento (delta)
-                content = chunk.choices[0].delta.content or ""
-                full_answer += content
-                # 3. Imprimimos el fragmento en la terminal sin saltar de línea
-                print(content, end="", flush=True)
-            
-            print() # Añadimos un salto de línea final
+    PREBUFFER_FIRST_MS = 160   # prebuffer solo al inicio
+    LOW_WATER_MS       = 120   # cuando el buffer cae por debajo, “top-up” rápido
+    def frames_for_ms(ms: int) -> int:
+        return int(RATE * (ms / 1000.0)) * 2
 
-            # --- FIN DE LA MODIFICACIÓN ---
+    audio_q: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=96)
 
-            # El resto del código usa la respuesta completa 'full_answer'
-            if not full_answer.strip(): # Si no hay respuesta, salimos
-                 return
-                 
-            # 👂 Vacía restos que quedaron en la cola de audio
-            while not audio_queue.empty():
-                try: audio_queue.get_nowait()
-                except asyncio.QueueEmpty: break
-
-            # 🗣️ ElevenLabs (esta parte no cambia, usa la respuesta completa)
-            VOICE_ID  = "IKne3meq5aSn9XLyUdCD"
-            VOICE_OPTS= {"stability":0.75,"similarity_boost":0.75,
-                         "style":0.45,"use_speaker_boost":True}
-
+    async def producer():
+        first = True
+        while True:
+            text = await tts_queue.get()
+            if text is None:
+                break
+            ol = 0 if first else 2  # 0 = arranque agresivo; 2 = robusto/estable
             pcm_gen = elevenlabs_client.text_to_speech.stream(
-                text=full_answer, # Usamos la variable con la respuesta completa
+                text=text,
                 voice_id=VOICE_ID,
-                model_id="eleven_multilingual_v2",
+                model_id=MODEL_ID,
                 output_format="pcm_16000",
                 voice_settings=VOICE_OPTS,
-                optimize_streaming_latency=0
+                optimize_streaming_latency=ol
             )
-            
-            # Tu lógica de búfer de audio (no necesita cambios)
-            buffer = b""
-            async for chunk in pcm_gen:
-                if not chunk: continue
-                buffer += chunk
-                while len(buffer) >= FRAME_BYTES:
-                    if not out.is_active(): out.start_stream()
-                    out.write(buffer[:FRAME_BYTES], exception_on_underflow=False)
-                    buffer = buffer[FRAME_BYTES:]
-            
-            pad = (FRAME_BYTES - len(buffer)) % FRAME_BYTES
-            if pad: out.write(buffer + b"\x00" * pad, exception_on_underflow=False)
-            else: out.write(buffer, exception_on_underflow=False)
-            out.write(b"\x00" * TAIL_SILENCE_FRAMES * 2, exception_on_underflow=False)
-            out.stop_stream()
+            async for b in pcm_gen:
+                if b:
+                    await audio_q.put(b)
+            first = False
+        await audio_q.put(None)
 
-        finally:
-            state.is_speaking = False
-        
-# --- 4. FUNCIÓN PRINCIPAL DE TRANSCRIPCIÓN (OÍDOS) ---
+    async def consumer():
+        first_audio = False
+        buf = bytearray()
+        eof = False
+        INITIAL = frames_for_ms(PREBUFFER_FIRST_MS)
+        LOW     = frames_for_ms(LOW_WATER_MS)
+
+        def write_from_buf():
+            nonlocal buf, first_audio
+            while len(buf) >= FRAME_BYTES:
+                chunk = bytes(buf[:FRAME_BYTES]); del buf[:FRAME_BYTES]
+                if not out.is_active():
+                    out.start_stream()
+                if not first_audio:
+                    state.is_speaking = True
+                    tts_started_event.set()
+                    first_audio = True
+                out.write(chunk)
+
+        # prebuffer SOLO al principio
+        while len(buf) < INITIAL and not eof:
+            item = await audio_q.get()
+            if item is None:
+                eof = True; break
+            buf.extend(item)
+        write_from_buf()
+
+        # luego, flujo continuo
+        while True:
+            if len(buf) >= FRAME_BYTES:
+                write_from_buf()
+            else:
+                # intenta traer algo rápido sin bloquear
+                pulled = False
+                for _ in range(4):
+                    try:
+                        item = audio_q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if item is None:
+                        eof = True; break
+                    buf.extend(item); pulled = True
+                    if len(buf) >= FRAME_BYTES:
+                        break
+                if not pulled:
+                    await asyncio.sleep(0.004)
+
+            if eof and len(buf) < FRAME_BYTES:
+                if len(buf):
+                    out.write(bytes(buf)); buf.clear()
+                break
+
+            if len(buf) < LOW and not eof:
+                try:
+                    item = await asyncio.wait_for(audio_q.get(), timeout=0.03)
+                    if item is None:
+                        eof = True
+                    else:
+                        buf.extend(item)
+                except asyncio.TimeoutError:
+                    pass
+
+        out.write(b"\x00" * TAIL_SILENCE_FRAMES * 2)
+        if out.is_active():
+            out.stop_stream()
+        state.is_speaking = False
+
+    await asyncio.gather(asyncio.create_task(producer()),
+                         asyncio.create_task(consumer()))
+
+
+async def process_llm_and_speak(text: str, audio_queue, state):
+    global conversation_history, assistant_printing
+
+    clear_partial_line(); sprint()
+    retrieved_context = await memory.get_context(text)
+
+    augmented_prompt = (
+        "Considera el siguiente contexto sobre mí. Úsalo únicamente si es directamente relevante. "
+        "Si no lo es, ignóralo por completo.\n"
+        "--- CONTEXTO ---\n"
+        f"{retrieved_context}\n"
+        "--- FIN DEL CONTEXTO ---\n\n"
+        f"Pregunta del usuario: {text}"
+    )
+
+    messages_to_send = [
+        {"role": "system",
+         "content": ("Eres JARVIS, el asistente personal del señor, un ingeniero brillante con visión futurista. "
+                     "Respondes con precisión, de forma corta (3-5 líneas máx), ingenio y respeto.")},
+        *conversation_history,
+        {"role": "user", "content": augmented_prompt},
+    ]
+
+    sprint(tag("ASISTENTE", BLUE) + ": ", end="")
+
+    # cola para TTS
+    tts_queue: asyncio.Queue = asyncio.Queue()
+    speaker_task = asyncio.create_task(speak_worker(tts_queue, state))
+
+    stream = await openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages_to_send,
+        stream=True
+    )
+
+    # impresión por lotes para no bloquear el loop
+    assistant_printing = True
+    CONSOLE_FLUSH_MS = 35
+    buf, console_buf = "", ""
+    full_answer = ""
+    last_flush = time.monotonic()
+    first_token_time = None
+    first_chunk_sent = False
+
+    async for chunk in stream:
+        token = chunk.choices[0].delta.content or ""
+        if not token:
+            continue
+
+        # acumula para consola
+        console_buf += token
+        now = time.monotonic()
+        if any(ch in console_buf[-3:] for ch in ".!?…") or len(console_buf) >= 48 or (now-last_flush)*1000 >= CONSOLE_FLUSH_MS:
+            sprint(c(console_buf, BLUE), end="")
+            console_buf = ""
+            last_flush = now
+
+        # segmentación para TTS
+        if first_token_time is None:
+            first_token_time = now
+        buf += token
+        full_answer += token
+
+        flush_piece = False
+        if not first_chunk_sent:
+            if (now - first_token_time)*1000 >= 260 and len(buf) >= 18:
+                flush_piece = True
+        else:
+            if any(ch in buf[-3:] for ch in ".!?…") and len(buf) >= 120:
+                flush_piece = True
+            elif len(buf) >= 300:
+                flush_piece = True
+            elif (now - last_flush)*1000 >= 700 and len(buf) >= 24:
+                flush_piece = True
+
+        if flush_piece:
+            await tts_queue.put(buf.strip())
+            buf = ""
+            first_chunk_sent = True
+
+    if console_buf:
+        sprint(c(console_buf, BLUE), end="")
+
+    tail = buf.strip()
+    if tail:
+        await tts_queue.put(tail)
+
+    await tts_queue.put(None)
+    await speaker_task
+
+    assistant_printing = False
+
+    if full_answer.strip():
+        conversation_history.append({"role": "user", "content": text})
+        conversation_history.append({"role": "assistant", "content": full_answer})
+        if len(conversation_history) > MAX_HISTORY_TURNS * 2:
+            conversation_history[:] = conversation_history[-(MAX_HISTORY_TURNS * 2):]
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 3.b) PREVIEW DEL LLM (SOLO CONSOLA, SIN TTS) — (Paso 2)
+# ───────────────────────────────────────────────────────────────────────────
+async def preview_llm(text: str):
+    global assistant_printing
+    assistant_printing = True
+    try:
+        messages = [
+            {"role": "system",
+             "content": ("Eres JARVIS en modo previsualización. Da una respuesta preliminar muy breve "
+                         "(1-2 líneas), sin conclusiones definitivas, hasta que llegue el mensaje final.")},
+            {"role": "user", "content": text}
+        ]
+        sprint("\n" + tag("ASISTENTE·preview", BLUE, dim=True) + ": ", end="")
+        stream = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            stream=True
+        )
+        # imprime en bloques, no token a token
+        buf, last = "", time.monotonic()
+        FLUSH_MS = 40
+        async for chunk in stream:
+            content = chunk.choices[0].delta.content or ""
+            if not content:
+                continue
+            buf += content
+            now = time.monotonic()
+            if any(ch in buf[-3:] for ch in ".!?…") or len(buf) >= 64 or (now-last)*1000 >= FLUSH_MS:
+                sprint(c(buf, BLUE + DIM), end="")
+                buf, last = "", now
+        if buf:
+            sprint(c(buf, BLUE + DIM), end="")
+        sprint()
+    except asyncio.CancelledError:
+        raise
+    finally:
+        assistant_printing = False
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 3.c) CONSUMIDOR DE COLA DE PARCIALES → LANZA/CANCELA PREVIEW
+# ───────────────────────────────────────────────────────────────────────────
+async def llm_streamer(loop):
+    global current_preview_task, grace_mode
+
+    MIN_MS_BETWEEN_PREVIEWS = 600
+    MIN_PREVIEW_CHARS = 18
+    last_preview_ts = 0.0
+    last_text = ""
+
+    def looks_like_short_command(t: str) -> bool:
+        words = t.strip().split()
+        if len(words) <= 8 and words:
+            first = words[0].lower()
+            return first in {
+                "abre","pon","pausa","reanuda","busca","cierra","enciende",
+                "apaga","ve","ir","muestra","llama","escribe","play","stop"
+            }
+        return False
+
+    while True:
+        partial_text = await llm_text_queue.get()
+        if grace_mode:
+            continue
+        if len(partial_text) < MIN_PREVIEW_CHARS:
+            continue
+        if looks_like_short_command(partial_text):
+            continue
+        if partial_text == last_text:
+            continue
+        now = time.monotonic()
+        if (now - last_preview_ts) * 1000 < MIN_MS_BETWEEN_PREVIEWS:
+            continue
+        last_preview_ts = now
+        last_text = partial_text
+
+        if current_preview_task and not current_preview_task.done():
+            current_preview_task.cancel()
+            try:
+                await current_preview_task
+            except asyncio.CancelledError:
+                pass
+        current_preview_task = loop.create_task(preview_llm(partial_text))
+
+# ───────────────────────────────────────────────────────────────────────────
+# 4) TRANSCRIPCIÓN DEEPGRAM: PARCIALES + FINAL CON GRACIA (idéntico al tuyo con fixes)
+# ───────────────────────────────────────────────────────────────────────────
 async def transcribe_audio(loop, audio_queue, state):
-    """Envía audio a Deepgram y pasa frases completas a GPT-4o."""
-    import websockets, json                     # imports locales
-    DEEPGRAM_URL = (f"wss://api.deepgram.com/v1/listen?"
-                    f"encoding=linear16&sample_rate=16000&channels=1&language=es"
-                    f"&endpointing=450&smart_format=true")
+    """
+    Deepgram en streaming con:
+      - Parciales con debounce + primer parcial rápido.
+      - Finales con coalescing + tail-merge (con deduplicación de solape).
+      - Ventana de gracia que PAUSA previews.
+      - Reset de estado al enviar la respuesta final.
+      - Consola: usuario en rojo.
+    """
+    global grace_mode, suppress_user_partials  # ⬅️ añadimos el global aquí
+
+    ENDPOINTING_MS       = 900
+    FINAL_GRACE_MS       = 900
+    MIN_FINAL_CHARS      = 12
+    PARTIAL_MIN_CHARS    = 4
+    PARTIAL_DEBOUNCE_MS  = 90
+
+    DEEPGRAM_URL = (
+        "wss://api.deepgram.com/v1/listen?"
+        f"encoding=linear16&sample_rate={RATE}&channels=1"
+        "&language=es&smart_format=true"
+        "&interim_results=true"
+        f"&endpointing={ENDPOINTING_MS}"
+    )
+
+    last_partial_ts    = 0.0
+    last_partial_text  = ""
+    first_partial_done = False
+
+    pending_final_text   = ""
+    last_final_time_mono = 0.0
+    finalize_task        = None
+    final_seq            = 0
+
+    def print_user_final_line(text: str):
+        lbl = tag("TÚ", RED)
+        sprint(f"\n{lbl}: {text}\n")
+
+    async def finalize_if_quiet(my_seq: int):
+        nonlocal pending_final_text, last_final_time_mono, finalize_task
+        nonlocal first_partial_done, last_partial_ts, last_partial_text, final_seq
+        global grace_mode, suppress_user_partials, current_llm_task  # ⬅️ aquí sí global
+
+        await asyncio.sleep(FINAL_GRACE_MS / 1000.0)
+        if my_seq != final_seq:
+            finalize_task = None; return
+        if (time.monotonic() - last_final_time_mono) * 1000 < FINAL_GRACE_MS:
+            finalize_task = None; return
+
+        text = pending_final_text.strip()
+        if not text:
+            finalize_task = None; return
+        if not (len(text) >= MIN_FINAL_CHARS or text.endswith((".", "?", "!", "…"))):
+            finalize_task = None; return
+
+        # cancelar preview activo
+        if current_preview_task and not current_preview_task.done():
+            current_preview_task.cancel()
+            try:
+                await current_preview_task
+            except asyncio.CancelledError:
+                pass
+
+        # ⬇️ bien alineado (antes estaba mal indentado)
+        clear_partial_line()
+        print_user_final_line(text)
+
+        # preparar señal de arranque de audio
+        tts_started_event.clear()
+
+        # Lanza la respuesta final (con TTS por trozos) y bloquea parciales de [TÚ]
+        suppress_user_partials = True
+        current_llm_task = loop.create_task(process_llm_and_speak(text, audio_queue, state))
+
+        # Cuando termine la respuesta, volvemos a permitir parciales
+        async def _release_after_assistant():
+            global suppress_user_partials   # ⬅️ era nonlocal, debe ser global
+            try:
+                await current_llm_task
+            finally:
+                suppress_user_partials = False
+        asyncio.create_task(_release_after_assistant())
+
+        # Mantén 'grace_mode' hasta que arranque el TTS (evita que [TÚ] pise a [ASISTENTE])
+        async def _drop_grace_on_tts_start():
+            global grace_mode
+            try:
+                await asyncio.wait_for(tts_started_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+            grace_mode = False
+        asyncio.create_task(_drop_grace_on_tts_start())
+
+        # RESET de estado del turno
+        pending_final_text = ""
+        first_partial_done = False
+        last_partial_text = ""
+        last_partial_ts = 0.0
+        final_seq = 0
+        finalize_task = None
 
     async with websockets.connect(
-        DEEPGRAM_URL, additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+        DEEPGRAM_URL,
+        additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
     ) as ws:
-        print("🟢 Conectado a Deepgram. ¡Habla ahora!")
+        sprint(c("🟢 Conectado a Deepgram. ¡Habla ahora!", GRAY))
 
-        # -------------- NUEVO sender() --------------
         async def sender():
-            KEEPALIVE_EVERY = 3          # segundos (Deepgram corta a los ~10 s)
-            last_sent = time.monotonic()
-
+            # Warmup 100 ms de silencio
+            try:
+                await ws.send(b"\x00" * int(RATE * 0.1) * 2)
+            except Exception:
+                pass
+            KEEPALIVE_EVERY = 3.0
             while True:
-                if not state.is_speaking:
-                    data = await audio_queue.get()      # audio real
+                try:
+                    data = await asyncio.wait_for(audio_queue.get(), timeout=KEEPALIVE_EVERY)
                     await ws.send(data)
-                    last_sent = time.monotonic()
-                else:
-                    # Durante la locución envía solo KeepAlive
-                    if time.monotonic() - last_sent >= KEEPALIVE_EVERY:
-                        await ws.send('{"type":"KeepAlive"}')
-                        last_sent = time.monotonic()
-                    await asyncio.sleep(0.05)           # no satures CPU
-        # --------------------------------------------
-
+                except asyncio.TimeoutError:
+                    await ws.send('{"type":"KeepAlive"}')
+                    await asyncio.sleep(0.05)
 
         async def receiver():
-            full = ""
+            nonlocal last_partial_ts, last_partial_text, first_partial_done
+            nonlocal pending_final_text, last_final_time_mono, finalize_task, final_seq
+            global grace_mode
+
             async for msg in ws:
-                res   = json.loads(msg)
-                trans = res.get("channel", {}).get("alternatives", [{}])[0].get("transcript", "")
-                if trans and res.get("is_final", False):
-                    full += trans + " "
-                    print(f"Tú: {full}")
-                    if not state.is_speaking:   # no interrumpir la locución
-                        loop.create_task(process_llm_and_speak(full, audio_queue, state))
-                    full = ""
+                res  = json.loads(msg)
+                alt  = res.get("channel", {}).get("alternatives", [{}])[0]
+                trans= alt.get("transcript", "") or ""
+                if not trans:
+                    continue
+
+                if res.get("is_final", False):
+                    grace_mode = True
+                    pending_final_text = (
+                        merge_with_overlap(pending_final_text, trans)
+                        if pending_final_text else trans.strip()
+                    )
+                    last_final_time_mono = time.monotonic()
+
+                    final_seq += 1
+                    my_seq = final_seq
+                    finalize_task = asyncio.create_task(finalize_if_quiet(my_seq))
+
+                else:
+                    now = time.monotonic()
+
+                    # Tail-merge durante gracia con deduplicación
+                    if grace_mode and (now - last_final_time_mono) * 1000 < FINAL_GRACE_MS:
+                        pending_final_text = merge_with_overlap(pending_final_text, trans)
+                        last_final_time_mono = now
+                        continue  # no preview en gracia
+
+                    # Primer parcial sin debounce
+                    if not first_partial_done:
+                        if suppress_user_partials:
+                            continue
+                        render_user_partial(trans, width=120)
+                        first_partial_done = True
+                        last_partial_text = trans
+                        last_partial_ts = now
+                        if not grace_mode:
+                            try:
+                                llm_text_queue.put_nowait(trans)
+                            except asyncio.QueueFull:
+                                try: _ = llm_text_queue.get_nowait()
+                                except Exception: pass
+                                await llm_text_queue.put(trans)
+                        continue
+
+                    # Siguientes parciales con debounce
+                    if len(trans) >= PARTIAL_MIN_CHARS and (now - last_partial_ts) * 1000 >= PARTIAL_DEBOUNCE_MS:
+                        if trans != last_partial_text:
+                            if suppress_user_partials:
+                                continue
+                            render_user_partial(trans, width=120)
+                            last_partial_text = trans
+                            last_partial_ts = now
+                            if not grace_mode:
+                                try:
+                                    llm_text_queue.put_nowait(trans)
+                                except asyncio.QueueFull:
+                                    try: _ = llm_text_queue.get_nowait()
+                                    except Exception: pass
+                                    await llm_text_queue.put(trans)
 
         await asyncio.gather(sender(), receiver())
 
 
-# --- 5. PUNTO DE ENTRADA PRINCIPAL (PATRÓN CORREGIDO) ---
+# ───────────────────────────────────────────────────────────────────────────
+# 5) MAIN
+# ───────────────────────────────────────────────────────────────────────────
+_streamer_started = False  # lanzamos el streamer una sola vez
+
 async def main():
+    global _streamer_started
+
     audio_queue = asyncio.Queue()
     loop        = asyncio.get_running_loop()
 
@@ -216,10 +683,23 @@ async def main():
     )
     mic_thread.start()
 
+    # Consumidor de parciales para preview del LLM (una sola vez)
+    if not _streamer_started:
+        loop.create_task(llm_streamer(loop))
+        _streamer_started = True
+
     await transcribe_audio(loop, audio_queue, state)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\n👋 Asistente detenido.")
+        sprint(c("\n\n👋 Asistente detenido.", GRAY))
+    finally:
+        try:
+            if out.is_active():
+                out.stop_stream()
+            out.close()
+        except Exception:
+            pass
+        pa.terminate()
