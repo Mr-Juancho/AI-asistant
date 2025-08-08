@@ -18,6 +18,7 @@ from openai import AsyncOpenAI
 from elevenlabs.client import AsyncElevenLabs
 from memory import MemoryManager
 
+#comentario adicional
 # ───────────────────────────────────────────────────────────────────────────
 # 1) CONFIG INICIAL
 # ───────────────────────────────────────────────────────────────────────────
