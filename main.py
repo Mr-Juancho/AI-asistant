@@ -48,12 +48,6 @@ out = pa.open(format=pyaudio.paInt16,
               frames_per_buffer=CHUNK,
               start=False)
 
-<<<<<<< HEAD
-# --- NUEVO: HISTORIAL DE CONVERSACIÓN ---
-conversation_history = []
-MAX_HISTORY_TURNS = 5
-# ─── NUEVO ────────────────────────────────────────────────────────────────
-=======
 # Historial (RAM por ahora)
 conversation_history = []
 MAX_HISTORY_TURNS = 5
@@ -71,7 +65,6 @@ assistant_printing = False  # suspende la línea [TÚ] mientras el asistente imp
 
 
 # Estado compartido
->>>>>>> version-2.0
 class SharedState:
     def __init__(self):
         self.is_speaking = False      # True solo al arrancar TTS
@@ -181,68 +174,6 @@ FIRST_CHUNK_TIME_FLUSH_MS = 260  # antes 280
 FIRST_CHUNK_MIN_CHARS     = 18   # antes 16
 
 
-<<<<<<< HEAD
-# --- 3. FUNCIÓN DEL CEREBRO (LLM) Y BOCA (TTS) ---
-# Reemplaza esta función completa en tu main.py
-
-async def process_llm_and_speak(text: str, audio_queue, state):
-    """Genera respuesta, la muestra en tiempo real, la lee y recuerda la conversación."""
-    global out, FRAME_BYTES, conversation_history
-    async with speak_lock:
-        state.is_speaking = True
-        try:
-            retrieved_context = await memory.get_context(text)
-
-            augmented_prompt = (
-                f"Considera el siguiente contexto sobre mí. Úsalo únicamente si es directamente relevante para responder mi pregunta. Si no lo es, ignóralo por completo.\n"
-                f"--- CONTEXTO ---\n"
-                f"{retrieved_context}\n"
-                f"--- FIN DEL CONTEXTO ---\n\n"
-                f"Pregunta del usuario: {text}"
-            )
-
-            messages_to_send = [
-                {"role": "system",
-                 "content": "Eres JARVIS, el asistente personal del señor, un ingeniero brillante con visión futurista. Respondes con precisión, de forma corta (3-5 lineas maximo), ingenio y respeto, combinando eficiencia con sutileza. Anticipas necesidades, resuelves problemas técnicos, y nunca repites innecesariamente. Mantén un tono profesional pero cercano, y actúa como un verdadero copiloto de inteligencia artificial. No haces preguntas sobre cómo puedes ayudar, ya que él sabe que esa es tu intención. Refiérete a él como 'señor'."}
-            ]
-            
-            messages_to_send.extend(conversation_history)
-            messages_to_send.append({"role": "user", "content": augmented_prompt})
-            
-            print("Asistente: ", end="", flush=True)
-            
-            stream = await openai_client.chat.completions.create(
-                model="gpt-4o",
-                messages=messages_to_send,
-                stream=True
-            )
-
-            full_answer = ""
-            async for chunk in stream:
-                content = chunk.choices[0].delta.content or ""
-                full_answer += content
-                print(content, end="", flush=True)
-            
-            print()
-
-            if full_answer.strip():
-                conversation_history.append({"role": "user", "content": text})
-                conversation_history.append({"role": "assistant", "content": full_answer})
-
-                if len(conversation_history) > MAX_HISTORY_TURNS * 2:
-                    conversation_history = conversation_history[-(MAX_HISTORY_TURNS * 2):]
-
-            if not full_answer.strip():
-                 return
-                 
-            while not audio_queue.empty():
-                try: audio_queue.get_nowait()
-                except asyncio.QueueEmpty: break
-
-            VOICE_ID  = "IKne3meq5aSn9XLyUdCD"
-            VOICE_OPTS= {"stability":0.75,"similarity_boost":0.75,
-                         "style":0.45,"use_speaker_boost":True}
-=======
 
 async def speak_worker(tts_queue: asyncio.Queue, state):
     global out, FRAME_BYTES, TAIL_SILENCE_FRAMES
@@ -263,7 +194,6 @@ async def speak_worker(tts_queue: asyncio.Queue, state):
         return int(RATE * (ms / 1000.0)) * 2
 
     audio_q: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=96)
->>>>>>> version-2.0
 
     async def producer():
         first = True
@@ -273,46 +203,18 @@ async def speak_worker(tts_queue: asyncio.Queue, state):
                 break
             ol = 0 if first else 2  # 0 = arranque agresivo; 2 = robusto/estable
             pcm_gen = elevenlabs_client.text_to_speech.stream(
-<<<<<<< HEAD
-                text=full_answer,
-=======
                 text=text,
->>>>>>> version-2.0
                 voice_id=VOICE_ID,
                 model_id=MODEL_ID,
                 output_format="pcm_16000",
                 voice_settings=VOICE_OPTS,
                 optimize_streaming_latency=ol
             )
-<<<<<<< HEAD
-            
-            buffer = b""
-            async for chunk in pcm_gen:
-                if not chunk: continue
-                buffer += chunk
-                while len(buffer) >= FRAME_BYTES:
-                    if not out.is_active(): out.start_stream()
-                    # --- LÍNEA CORREGIDA ---
-                    out.write(buffer[:FRAME_BYTES])
-                    buffer = buffer[FRAME_BYTES:]
-            
-            pad = (FRAME_BYTES - len(buffer)) % FRAME_BYTES
-            if pad:
-                # --- LÍNEA CORREGIDA ---
-                out.write(buffer + b"\x00" * pad)
-            else:
-                # --- LÍNEA CORREGIDA ---
-                out.write(buffer)
-            # --- LÍNEA CORREGIDA ---
-            out.write(b"\x00" * TAIL_SILENCE_FRAMES * 2)
-            out.stop_stream()
-=======
             async for b in pcm_gen:
                 if b:
                     await audio_q.put(b)
             first = False
         await audio_q.put(None)
->>>>>>> version-2.0
 
     async def consumer():
         first_audio = False
@@ -802,3 +704,5 @@ if __name__ == "__main__":
         except Exception:
             pass
         pa.terminate()
+
+#comentario adicional
